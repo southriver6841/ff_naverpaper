@@ -195,6 +195,7 @@ class RunConfig:
     keep_campaign_days: int = 60
     keep_user_days: int = 7
     max_run_seconds: int = 0  # 0 = 제한 없음
+    cookie_renew_days: int = 7  # NID_AUT 만료가 이 일수 이내면 미리 재로그인 (0 = 끔)
 
 
 # ---- 실행 중지 / 시간 제한 ---------------------------------------------------
@@ -462,6 +463,7 @@ async def run(config: RunConfig, log: Optional[Callable[[str], None]] = None) ->
                         config.login_proxy_url,
                         account_candidate_urls,
                         excluded_reward_sources,
+                        renew_days=config.cookie_renew_days,
                     )
 
                 await _process_accounts(session_db, history, result, config.accounts, process, emit, config.no_paper_record)
@@ -620,6 +622,72 @@ def check_storage_data_status(data):
 def is_naver_login_page(url: str) -> bool:
     """로그인이 필요한 페이지를 열었는데 여기로 오면 저장 쿠키가 거부된 것."""
     return "nid.naver.com" in str(url or "")
+
+
+# ---- 만료 전 자동 갱신 -------------------------------------------------------------
+RENEW_RETRY_SECONDS = 86400  # 갱신 실패 시 하루에 한 번만 재시도 (네이버 보안 차단 방지)
+
+
+def needs_cookie_renewal(storage, days: int, now: Optional[float] = None):
+    """NID_AUT 만료가 days 일 이내이거나 세션 쿠키면 미리 다시 로그인한다."""
+    if not days or days <= 0:
+        return False, "renewal disabled"
+    if not check_storage_data_status(storage)[0]:
+        return False, "not logged in"
+    now = time.time() if now is None else now
+    aut = next((c for c in (storage or {}).get("cookies", []) if c.get("name") == "NID_AUT"), {})
+    exp = aut.get("expires", -1)
+    if exp is None or exp == -1:
+        return True, "NID_AUT is a session cookie (login without keep-login)"
+    days_left = (exp - now) / 86400
+    if days_left <= days:
+        return True, f"NID_AUT expires in {days_left:.1f} days"
+    return False, f"NID_AUT expires in {days_left:.0f} days"
+
+
+def load_cookie_file(nid: str, cookie_dir: str):
+    try:
+        with open(cookie_path(cookie_dir, nid), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _renew_marker(cookie_dir: str, nid: str) -> str:
+    return os.path.join(cookie_dir, f"{nid}.renew_attempt")
+
+
+async def renew_cookie_if_needed(account: AccountConfig, cookie_dir: str, proxy_url: str, emit: Callable[[str], None], days: int) -> bool:
+    """만료가 가까우면 아이디/비밀번호로 새로 로그인해 쿠키를 늘린다. 실패해도 기존 쿠키는 그대로 둔다."""
+    storage = load_cookie_file(account.user_id, cookie_dir)
+    need, reason = needs_cookie_renewal(storage or {}, days)
+    if not need:
+        return False
+    if not account.password:
+        emit(f"{account.user_id}: cookie renewal needed ({reason}) but password is empty; log in manually")
+        return False
+    marker = _renew_marker(cookie_dir, account.user_id)
+    if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < RENEW_RETRY_SECONDS:
+        emit(f"{account.user_id}: cookie renewal needed ({reason}); last attempt failed recently, retry after 24h")
+        return False
+    os.makedirs(cookie_dir, exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(datetime.now().isoformat())
+    emit(f"{account.user_id}: cookie renewal started ({reason})")
+    try:
+        ret = await refresh_cookie(account, cookie_dir, proxy_url, emit)
+    except Exception as e:
+        ret = {"ret": "danger", "msg": str(e)}
+    if ret.get("ret") == "success":
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        _, after = needs_cookie_renewal(load_cookie_file(account.user_id, cookie_dir) or {}, days)
+        emit(f"{account.user_id}: cookie renewal success ({after})")
+        return True
+    emit(f"{account.user_id}: cookie renewal failed - {ret.get('msg')}; keep using current cookie")
+    return False
 
 
 def check_cookie_status(nid: str, cookie_dir: str):
@@ -2222,11 +2290,16 @@ async def process_account(
     login_proxy_url: str = "",
     candidate_urls: Optional[set[str]] = None,
     excluded_reward_sources: Optional[set[str]] = None,
+    renew_days: int = 7,
 ) -> AccountResult:
     from playwright.async_api import async_playwright
     from playwright_stealth import Stealth
 
     result = AccountResult(user_id=account.user_id)
+    try:
+        await renew_cookie_if_needed(account, cookie_dir, login_proxy_url, emit, renew_days)
+    except Exception as e:  # 갱신 문제로 적립을 막지 않는다
+        emit(f"{account.user_id}: cookie renewal error - {e}")
     campaign_links, already_visited_count = await fetch_naver_campaign_urls(session_db, account.user_id, candidate_urls)
     result.target_url_count = len(campaign_links) + already_visited_count
     if already_visited_count:

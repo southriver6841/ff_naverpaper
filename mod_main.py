@@ -61,6 +61,7 @@ class ModuleMain(PluginModuleBase):
             "keep_campaign_days": "60",
             "keep_user_days": "7",
             "max_run_minutes": "60",
+            "cookie_renew_days": "7",
             "no_paper_record": "True",
             "proxy_enabled": "False",
             "proxy_reward_enabled": "",
@@ -333,6 +334,7 @@ class ModuleMain(PluginModuleBase):
             keep_campaign_days=self._int_setting("keep_campaign_days", 60),
             keep_user_days=self._int_setting("keep_user_days", 7),
             max_run_seconds=max(0, self._int_setting("max_run_minutes", 60)) * 60,
+            cookie_renew_days=max(0, self._int_setting("cookie_renew_days", 7)),
         )
         return np_module.run_sync(config, log=lambda msg: P.logger.info(f"[NaverPaper] {msg}"))
 

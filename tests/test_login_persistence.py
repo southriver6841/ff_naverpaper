@@ -182,3 +182,98 @@ def test_relogin_failure_is_reported(fake_env, monkeypatch):
 
     assert result.visited_url_count == 0
     assert result.details and result.details[0].status == "login_error"
+
+
+# ---- 만료 전 자동 갱신 --------------------------------------------------------------
+
+DAY = 86400
+
+
+def test_needs_renewal_by_days_left():
+    now = time.time()
+    assert np.needs_cookie_renewal(_storage(NID_AUT=now + 3 * DAY, NID_SES=-1), 7, now)[0] is True
+    assert np.needs_cookie_renewal(_storage(NID_AUT=now + 30 * DAY, NID_SES=-1), 7, now)[0] is False
+    # 로그인 상태 유지 없이 받은 세션 쿠키 → 오래 못 가므로 갱신 대상
+    assert np.needs_cookie_renewal(_storage(NID_AUT=-1, NID_SES=-1), 7, now)[0] is True
+    # 쿠키가 없으면 갱신이 아니라 일반 로그인 흐름이 처리
+    assert np.needs_cookie_renewal({"cookies": []}, 7, now)[0] is False
+    # 0일이면 기능 끔
+    assert np.needs_cookie_renewal(_storage(NID_AUT=now + DAY, NID_SES=-1), 0, now)[0] is False
+
+
+def _write_cookie(cookie_dir, user_id, storage):
+    import json, os
+    os.makedirs(cookie_dir, exist_ok=True)
+    with open(np.cookie_path(cookie_dir, user_id), "w", encoding="utf-8") as f:
+        json.dump(storage, f)
+
+
+@pytest.fixture
+def renew_env(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_refresh(account, cookie_dir, proxy_url="", log=None):
+        calls.append(account.user_id)
+        if calls_ok[0]:
+            _write_cookie(cookie_dir, account.user_id, _storage(NID_AUT=time.time() + 365 * DAY, NID_SES=-1))
+            return {"ret": "success", "msg": "cookie refreshed"}
+        return {"ret": "warning", "msg": "captcha required"}
+
+    calls_ok = [True]
+    monkeypatch.setattr(np, "refresh_cookie", fake_refresh)
+    return calls, calls_ok, str(tmp_path / "cookies")
+
+
+def test_renew_logs_in_when_expiring_and_saves_new_cookie(renew_env):
+    calls, _, cookie_dir = renew_env
+    _write_cookie(cookie_dir, "u1", _storage(NID_AUT=time.time() + 2 * DAY, NID_SES=-1))
+    logs = []
+
+    renewed = asyncio.run(np.renew_cookie_if_needed(np.AccountConfig("u1", "pw"), cookie_dir, "", logs.append, 7))
+
+    assert renewed is True and calls == ["u1"]
+    assert np.needs_cookie_renewal(np.load_cookie_file("u1", cookie_dir), 7)[0] is False
+
+
+def test_renew_skips_fresh_cookie_and_missing_password(renew_env):
+    calls, _, cookie_dir = renew_env
+    _write_cookie(cookie_dir, "fresh", _storage(NID_AUT=time.time() + 200 * DAY, NID_SES=-1))
+    _write_cookie(cookie_dir, "nopw", _storage(NID_AUT=time.time() + DAY, NID_SES=-1))
+
+    asyncio.run(np.renew_cookie_if_needed(np.AccountConfig("fresh", "pw"), cookie_dir, "", lambda m: None, 7))
+    asyncio.run(np.renew_cookie_if_needed(np.AccountConfig("nopw", ""), cookie_dir, "", lambda m: None, 7))
+
+    assert calls == []
+
+
+def test_failed_renewal_keeps_old_cookie_and_waits_a_day(renew_env):
+    """갱신 실패(캡차 등) → 기존 쿠키 유지, 같은 날엔 다시 시도하지 않는다(네이버 보안 차단 방지)."""
+    calls, calls_ok, cookie_dir = renew_env
+    calls_ok[0] = False
+    old = _storage(NID_AUT=time.time() + 2 * DAY, NID_SES=-1)
+    _write_cookie(cookie_dir, "u1", old)
+    logs = []
+
+    first = asyncio.run(np.renew_cookie_if_needed(np.AccountConfig("u1", "pw"), cookie_dir, "", logs.append, 7))
+    second = asyncio.run(np.renew_cookie_if_needed(np.AccountConfig("u1", "pw"), cookie_dir, "", logs.append, 7))
+
+    assert first is False and second is False
+    assert calls == ["u1"]
+    assert np.load_cookie_file("u1", cookie_dir)["cookies"][0]["expires"] == old["cookies"][0]["expires"]
+    assert any("captcha required" in m for m in logs)
+
+
+def test_process_account_renews_before_visiting(fake_env, monkeypatch):
+    state, session, tmp = fake_env
+    monkeypatch.setattr(np, "get_naverpay_point_balance", _balance(state, logged_out_first=False))
+    seen = []
+
+    async def fake_renew(account, cookie_dir, proxy_url, emit, days):
+        seen.append((account.user_id, days))
+        return False
+
+    monkeypatch.setattr(np, "renew_cookie_if_needed", fake_renew)
+
+    asyncio.run(np.process_account(np.AccountConfig("u1", "pw"), session, str(tmp), "", lambda m: None, renew_days=5))
+
+    assert seen == [("u1", 5)]

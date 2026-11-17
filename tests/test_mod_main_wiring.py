@@ -97,3 +97,20 @@ def test_time_limit_setting_passed_to_run(mod_main, monkeypatch, tmp_path):
     m._run_now()
 
     assert captured["config"].max_run_seconds == 15 * 60
+
+
+def test_cookie_renew_setting_passed_to_run(mod_main, monkeypatch, tmp_path):
+    module, settings = mod_main
+    settings["cookie_renew_days"] = "10"
+    m = module.ModuleMain.__new__(module.ModuleMain)
+    np = module._load_source_module()
+    captured = {}
+    monkeypatch.setattr(m, "_accounts", lambda *a, **k: [np.AccountConfig(user_id="u", password="p")], raising=False)
+    monkeypatch.setattr(m, "_db_path", lambda: str(tmp_path / "x.db"), raising=False)
+    monkeypatch.setattr(m, "_cookie_dir", lambda: str(tmp_path), raising=False)
+    monkeypatch.setattr(m, "_ensure_dirs", lambda: None, raising=False)
+    monkeypatch.setattr(np, "run_sync", lambda config, log=None: captured.setdefault("config", config))
+
+    m._run_now()
+
+    assert captured["config"].cookie_renew_days == 10

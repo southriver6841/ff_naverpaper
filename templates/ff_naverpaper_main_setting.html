@@ -5,7 +5,7 @@
 <div class="alert alert-warning">Required packages are missing. Open the package install menu and install all required packages. ({{ arg['dependency_error'] }})</div>
 {% endif %}
 
-{{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장'], ['run_now_btn', '지금 실행']]) }}
+{{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장'], ['run_now_btn', '지금 실행'], ['run_stop_btn', '중지']]) }}
 {{ macros.m_row_start('5') }}
 {{ macros.m_row_end() }}
 
@@ -23,6 +23,7 @@
     {{ macros.setting_checkbox('no_paper_record', '미수집 결과 기록', value=arg['no_paper_record'], desc=['방문할 URL이 없는 계정도 결과 페이지에 기록합니다.']) }}
     {{ macros.setting_input_text('keep_campaign_days', '캠페인 보관 일수', value=arg['keep_campaign_days']) }}
     {{ macros.setting_input_text('keep_user_days', '쿠키 DB 보관 일수', value=arg['keep_user_days']) }}
+    {{ macros.setting_input_text('max_run_minutes', '최대 실행 시간(분)', value=arg['max_run_minutes'], desc=['이 시간을 넘기면 진행 중인 링크까지만 처리하고 멈춥니다. 0이면 제한 없음.', '기본값: 60']) }}
     {{ macros.info_text('scheduler_active', '스케줄 등록 상태', value=arg['scheduler_active']) }}
     {{ macros.info_text('is_running', '현재 실행 상태', value=arg['is_running']) }}
     {{ macros.m_tab_content_end() }}
@@ -77,6 +78,13 @@ $("body").on('click', '#run_now_btn', function(e) {
     if (ret.ret !== 'success') {
       notify(ret.msg || '실행 시작 실패', 'warning');
     }
+  });
+});
+
+$("body").on('click', '#run_stop_btn', function(e) {
+  e.preventDefault();
+  globalSendCommand('run_stop', null, null, null, function(ret) {
+    notify(ret.msg || '', ret.ret === 'success' ? 'success' : 'warning');
   });
 });
 

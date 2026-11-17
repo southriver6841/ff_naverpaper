@@ -60,6 +60,7 @@ class ModuleMain(PluginModuleBase):
             "paper_schedule": "0 3,9,15,21 * * *",
             "keep_campaign_days": "60",
             "keep_user_days": "7",
+            "max_run_minutes": "60",
             "no_paper_record": "True",
             "proxy_enabled": "False",
             "proxy_reward_enabled": "",
@@ -111,7 +112,9 @@ class ModuleMain(PluginModuleBase):
         if not arg.get("proxy_reward_enabled"):
             arg["proxy_reward_enabled"] = arg.get("proxy_enabled", "False")
         arg["scheduler_active"] = F.scheduler.is_include(self._job_id())
-        arg["is_running"] = F.scheduler.is_running(self._job_id())
+        with self.collection_lock:
+            collection_running = self.collection_running
+        arg["is_running"] = bool(F.scheduler.is_running(self._job_id()) or collection_running)
         arg["db_path"] = self._db_path()
         arg["cookie_dir"] = self._cookie_dir()
         arg["package_name"] = P.package_name
@@ -140,6 +143,8 @@ class ModuleMain(PluginModuleBase):
         try:
             if command == "run_now":
                 return jsonify(self._start_run_now_background())
+            if command == "run_stop":
+                return jsonify(self._request_stop())
             if command == "manual_reward":
                 return jsonify(self._start_manual_reward_background(arg1))
             if command == "sync_scheduler":
@@ -289,6 +294,18 @@ class ModuleMain(PluginModuleBase):
         finally:
             self._mark_collection_finished()
 
+    def _request_stop(self):
+        with self.collection_lock:
+            running = self.collection_running
+        if not running:
+            return {"ret": "warning", "msg": "실행 중인 작업이 없습니다."}
+        np_module = self._try_np()
+        if not np_module:
+            return {"ret": "warning", "msg": "source module is not available"}
+        np_module.request_stop()
+        P.logger.info("[NaverPaper] stop requested by user")
+        return {"ret": "success", "msg": "중지를 요청했습니다. 진행 중인 링크가 끝나면 멈춥니다."}
+
     def _mark_collection_running(self):
         with self.collection_lock:
             if self.collection_running:
@@ -315,6 +332,7 @@ class ModuleMain(PluginModuleBase):
             no_paper_record=self._bool_setting("no_paper_record", True),
             keep_campaign_days=self._int_setting("keep_campaign_days", 60),
             keep_user_days=self._int_setting("keep_user_days", 7),
+            max_run_seconds=max(0, self._int_setting("max_run_minutes", 60)) * 60,
         )
         return np_module.run_sync(config, log=lambda msg: P.logger.info(f"[NaverPaper] {msg}"))
 

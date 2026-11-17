@@ -194,6 +194,58 @@ class RunConfig:
     no_paper_record: bool = False
     keep_campaign_days: int = 60
     keep_user_days: int = 7
+    max_run_seconds: int = 0  # 0 = 제한 없음
+
+
+# ---- 실행 중지 / 시간 제한 ---------------------------------------------------
+# 한 번에 하나의 실행만 돌기 때문에(mod_main 의 collection_lock) 모듈 전역 상태로 충분하다.
+_stop_event = threading.Event()
+_run_deadline: Optional[float] = None
+_monotonic = time.monotonic
+
+
+class RunCancelled(Exception):
+    def __init__(self, status: str):
+        super().__init__(status)
+        self.status = status
+
+
+def request_stop():
+    _stop_event.set()
+
+
+def clear_stop_request():
+    _stop_event.clear()
+
+
+def is_stop_requested() -> bool:
+    return _stop_event.is_set()
+
+
+def cancel_reason() -> Optional[str]:
+    """중지 요청이면 'stopped', 시간 초과면 'timeout', 아니면 None."""
+    if _stop_event.is_set():
+        return "stopped"
+    if _run_deadline is not None and _monotonic() >= _run_deadline:
+        return "timeout"
+    return None
+
+
+def _raise_if_cancelled():
+    reason = cancel_reason()
+    if reason:
+        raise RunCancelled(reason)
+
+
+def _begin_run_window(max_run_seconds: int = 0):
+    global _run_deadline
+    _stop_event.clear()
+    _run_deadline = _monotonic() + max_run_seconds if max_run_seconds and max_run_seconds > 0 else None
+
+
+def _end_run_window():
+    global _run_deadline
+    _run_deadline = None
 
 
 @dataclass
@@ -270,6 +322,96 @@ def _run_async_in_thread(coro_factory):
     raise value
 
 
+def _mark_stale_runs_interrupted(session_db):
+    """이전 실행이 재시작 등으로 'running'에 멈춰 있으면 정리한다."""
+    stale = session_db.query(RunHistory).filter(RunHistory.status == "running").all()
+    for row in stale:
+        row.status = "interrupted"
+        row.finished_at = row.finished_at or datetime.now()
+        if not row.message:
+            row.message = "process restarted or crashed before finishing"
+    return len(stale)
+
+
+def _account_error_result(account: AccountConfig, error: Exception) -> "AccountResult":
+    account_result = AccountResult(user_id=account.user_id)
+    account_result.details.append(DetailResult(user_id=account.user_id, status="error", message=str(error)))
+    return account_result
+
+
+def _record_account_result(session_db, history, result: RunResult, account: AccountConfig, account_result, no_paper_record: bool = False):
+    result.account_results.append(account_result)
+    result.estimated_points += account_result.estimated_points
+    result.skipped_url_count += account_result.skipped_url_count
+    result.visited_url_count += account_result.visited_url_count
+    result.details.extend(account_result.details)
+    for detail in account_result.details:
+        session_db.add(
+            RunDetail(
+                run_id=history.id,
+                user_id=detail.user_id,
+                url=detail.url,
+                status=detail.status,
+                point=detail.point,
+                message=detail.message,
+            )
+        )
+    session_db.add(
+        RunAccountSummary(
+            run_id=history.id,
+            user_id=account.user_id,
+            target_url_count=account_result.target_url_count,
+            skipped_url_count=account_result.skipped_url_count,
+            visited_url_count=account_result.visited_url_count,
+            estimated_points=account_result.estimated_points,
+            detail_count=len(account_result.details),
+            message=account_result.message if hasattr(account_result, "message") else "",
+        )
+    )
+    if no_paper_record and account_result.visited_url_count == 0 and not account_result.details:
+        session_db.add(
+            RunDetail(
+                run_id=history.id,
+                user_id=account.user_id,
+                status="no_url",
+                message="No unvisited campaign URL",
+            )
+        )
+    _sync_history(history, result)
+
+
+def _sync_history(history, result: RunResult):
+    history.account_count = result.account_count
+    history.collected_url_count = result.collected_url_count
+    history.skipped_url_count = result.skipped_url_count
+    history.visited_url_count = result.visited_url_count
+    history.estimated_points = result.estimated_points
+
+
+def _finish_history(session_db, history, result: RunResult):
+    result.finished_at = datetime.now()
+    history.finished_at = result.finished_at
+    history.status = result.status
+    _sync_history(history, result)
+    history.message = result.message
+    session_db.commit()
+
+
+async def _process_accounts(session_db, history, result: RunResult, accounts, process, emit, no_paper_record: bool = False):
+    """계정마다 독립 실행: 한 계정 실패가 나머지를 막지 않고, 끝날 때마다 저장한다."""
+    for account in accounts:
+        _raise_if_cancelled()
+        try:
+            account_result = await process(account)
+        except Exception as e:
+            emit(f"{account.user_id}: account failed - {e}")
+            emit(traceback.format_exc())
+            account_result = _account_error_result(account, e)
+        _record_account_result(session_db, history, result, account, account_result, no_paper_record)
+        session_db.commit()
+    _raise_if_cancelled()
+
+
 async def run(config: RunConfig, log: Optional[Callable[[str], None]] = None) -> RunResult:
     db = Database(config.db_path)
     db.create_all()
@@ -279,96 +421,67 @@ async def run(config: RunConfig, log: Optional[Callable[[str], None]] = None) ->
         if log:
             log(message)
 
-    with db.get_session() as session_db:
-        history = RunHistory(started_at=result.started_at, status="running", account_count=result.account_count)
-        session_db.add(history)
-        session_db.flush()
+    _begin_run_window(config.max_run_seconds)
+    try:
+        with db.get_session() as session_db:
+            stale = _mark_stale_runs_interrupted(session_db)
+            if stale:
+                emit(f"Marked {stale} unfinished previous run(s) as interrupted")
+            history = RunHistory(started_at=result.started_at, status="running", account_count=result.account_count)
+            session_db.add(history)
+            session_db.commit()
 
-        try:
-            emit("Campaign URL collection started")
-            emit(f"Proxy mode login={mask_proxy_url(config.login_proxy_url)} reward={mask_proxy_url(config.reward_proxy_url)}")
-            collected_urls, _existing_collected_urls, account_collected_urls = await save_naver_campaign_urls(
-                session_db,
-                emit,
-                config.reward_proxy_url,
-                config.accounts,
-                config.cookie_dir,
-                config.login_proxy_url,
-            )
-            result.collected_url_count = len(collected_urls)
-            emit(f"Campaign URL collection finished: {result.collected_url_count}")
-            excluded_reward_sources = load_excluded_reward_sources(session_db)
-            if excluded_reward_sources:
-                emit(f"Loaded excluded reward sources: {len(excluded_reward_sources)}")
-
-            for account in config.accounts:
-                account_candidate_urls = set(collected_urls)
-                account_candidate_urls.update(account_collected_urls.get(account.user_id, set()))
-                account_result = await process_account(
-                    account,
+            try:
+                emit("Campaign URL collection started")
+                emit(f"Proxy mode login={mask_proxy_url(config.login_proxy_url)} reward={mask_proxy_url(config.reward_proxy_url)}")
+                collected_urls, _existing_collected_urls, account_collected_urls = await save_naver_campaign_urls(
                     session_db,
-                    config.cookie_dir,
-                    config.reward_proxy_url,
                     emit,
+                    config.reward_proxy_url,
+                    config.accounts,
+                    config.cookie_dir,
                     config.login_proxy_url,
-                    account_candidate_urls,
-                    excluded_reward_sources,
                 )
-                result.account_results.append(account_result)
-                result.estimated_points += account_result.estimated_points
-                result.skipped_url_count += account_result.skipped_url_count
-                result.visited_url_count += account_result.visited_url_count
-                result.details.extend(account_result.details)
-                for detail in account_result.details:
-                    session_db.add(
-                        RunDetail(
-                            run_id=history.id,
-                            user_id=detail.user_id,
-                            url=detail.url,
-                            status=detail.status,
-                            point=detail.point,
-                            message=detail.message,
-                        )
-                    )
-                session_db.add(
-                    RunAccountSummary(
-                        run_id=history.id,
-                        user_id=account.user_id,
-                        target_url_count=account_result.target_url_count,
-                        skipped_url_count=account_result.skipped_url_count,
-                        visited_url_count=account_result.visited_url_count,
-                        estimated_points=account_result.estimated_points,
-                        detail_count=len(account_result.details),
-                        message=account_result.message if hasattr(account_result, "message") else "",
-                    )
-                )
-                if config.no_paper_record and account_result.visited_url_count == 0 and not account_result.details:
-                    session_db.add(
-                        RunDetail(
-                            run_id=history.id,
-                            user_id=account.user_id,
-                            status="no_url",
-                            message="No unvisited campaign URL",
-                        )
+                result.collected_url_count = len(collected_urls)
+                _sync_history(history, result)
+                session_db.commit()  # 수집 결과와 링크 확인 캐시를 먼저 보존
+                emit(f"Campaign URL collection finished: {result.collected_url_count}")
+                excluded_reward_sources = load_excluded_reward_sources(session_db)
+                if excluded_reward_sources:
+                    emit(f"Loaded excluded reward sources: {len(excluded_reward_sources)}")
+
+                async def process(account):
+                    account_candidate_urls = set(collected_urls)
+                    account_candidate_urls.update(account_collected_urls.get(account.user_id, set()))
+                    return await process_account(
+                        account,
+                        session_db,
+                        config.cookie_dir,
+                        config.reward_proxy_url,
+                        emit,
+                        config.login_proxy_url,
+                        account_candidate_urls,
+                        excluded_reward_sources,
                     )
 
-            delete_old_stuff(session_db, config.keep_campaign_days, config.keep_user_days, emit)
-            result.status = "completed"
-            result.message = ""
-        except Exception as e:
-            result.status = "error"
-            result.message = str(e)
-            emit(traceback.format_exc())
-        finally:
-            result.finished_at = datetime.now()
-            history.finished_at = result.finished_at
-            history.status = result.status
-            history.account_count = result.account_count
-            history.collected_url_count = result.collected_url_count
-            history.skipped_url_count = result.skipped_url_count
-            history.visited_url_count = result.visited_url_count
-            history.estimated_points = result.estimated_points
-            history.message = result.message
+                await _process_accounts(session_db, history, result, config.accounts, process, emit, config.no_paper_record)
+
+                delete_old_stuff(session_db, config.keep_campaign_days, config.keep_user_days, emit)
+                result.status = "completed"
+                result.message = ""
+            except RunCancelled as e:
+                result.status = e.status
+                result.message = "stopped by user" if e.status == "stopped" else f"time limit exceeded ({config.max_run_seconds}s)"
+                emit(f"Run {e.status}: {result.message}")
+            except Exception as e:
+                session_db.rollback()
+                result.status = "error"
+                result.message = str(e)
+                emit(traceback.format_exc())
+            finally:
+                _finish_history(session_db, history, result)
+    finally:
+        _end_run_window()
 
     return result
 
@@ -396,88 +509,47 @@ async def run_manual_link(
         result.message = "manual link is empty"
         return result
 
-    with db.get_session() as session_db:
-        history = RunHistory(started_at=result.started_at, status="running", account_count=result.account_count, collected_url_count=1)
-        session_db.add(history)
-        session_db.flush()
+    _begin_run_window(0)
+    try:
+        with db.get_session() as session_db:
+            _mark_stale_runs_interrupted(session_db)
+            history = RunHistory(started_at=result.started_at, status="running", account_count=result.account_count, collected_url_count=1)
+            session_db.add(history)
+            session_db.commit()
 
-        try:
-            emit(f"Manual reward started: {link}")
-            emit(f"Proxy mode login={mask_proxy_url(login_proxy_url)} reward={mask_proxy_url(reward_proxy_url)}")
-            for account in accounts:
-                account_result = await process_account_manual_link(
-                    account,
-                    session_db,
-                    cookie_dir,
-                    reward_proxy_url,
-                    link,
-                    emit,
-                    login_proxy_url,
-                )
-                result.account_results.append(account_result)
-                result.estimated_points += account_result.estimated_points
-                result.skipped_url_count += account_result.skipped_url_count
-                result.visited_url_count += account_result.visited_url_count
-                result.details.extend(account_result.details)
-                for detail in account_result.details:
-                    session_db.add(
-                        RunDetail(
-                            run_id=history.id,
-                            user_id=detail.user_id,
-                            url=detail.url,
-                            status=detail.status,
-                            point=detail.point,
-                            message=detail.message,
-                        )
-                    )
-                session_db.add(
-                    RunAccountSummary(
-                        run_id=history.id,
-                        user_id=account.user_id,
-                        target_url_count=account_result.target_url_count,
-                        skipped_url_count=account_result.skipped_url_count,
-                        visited_url_count=account_result.visited_url_count,
-                        estimated_points=account_result.estimated_points,
-                        detail_count=len(account_result.details),
-                        message=account_result.message if hasattr(account_result, "message") else "",
-                    )
-                )
+            try:
+                emit(f"Manual reward started: {link}")
+                emit(f"Proxy mode login={mask_proxy_url(login_proxy_url)} reward={mask_proxy_url(reward_proxy_url)}")
 
-            result.status = "completed"
-            result.message = ""
-        except Exception as e:
-            result.status = "error"
-            result.message = str(e)
-            emit(traceback.format_exc())
-        finally:
-            result.finished_at = datetime.now()
-            history.finished_at = result.finished_at
-            history.status = result.status
-            history.account_count = result.account_count
-            history.collected_url_count = result.collected_url_count
-            history.skipped_url_count = result.skipped_url_count
-            history.visited_url_count = result.visited_url_count
-            history.estimated_points = result.estimated_points
-            history.message = result.message
+                async def process(account):
+                    return await process_account_manual_link(
+                        account,
+                        session_db,
+                        cookie_dir,
+                        reward_proxy_url,
+                        link,
+                        emit,
+                        login_proxy_url,
+                    )
+
+                await _process_accounts(session_db, history, result, accounts, process, emit)
+                result.status = "completed"
+                result.message = ""
+            except RunCancelled as e:
+                result.status = e.status
+                result.message = "stopped by user"
+                emit(f"Manual reward {e.status}")
+            except Exception as e:
+                session_db.rollback()
+                result.status = "error"
+                result.message = str(e)
+                emit(traceback.format_exc())
+            finally:
+                _finish_history(session_db, history, result)
+    finally:
+        _end_run_window()
 
     return result
-
-
-def run_manual_link_sync(
-    db_path: str,
-    cookie_dir: str,
-    accounts: list[AccountConfig],
-    link: str,
-    reward_proxy_url: str = "",
-    log: Optional[Callable[[str], None]] = None,
-    login_proxy_url: str = "",
-):
-    _cleanup_login_sessions_sync(log=log)
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _run_coro_blocking(run_manual_link(db_path, cookie_dir, accounts, link, reward_proxy_url, log, login_proxy_url))
-    return _run_async_in_thread(lambda: run_manual_link(db_path, cookie_dir, accounts, link, reward_proxy_url, log, login_proxy_url))
 
 
 @dataclass
@@ -631,33 +703,60 @@ async def password_login_on_page(page, account: AccountConfig, emit: Callable[[s
     return False, "login did not produce required cookies"
 
 
+# (체크박스 input, 클릭할 label) — 현재 네이버 화면은 #loginStay 를 CSS로 숨기고 label로 토글한다.
+KEEP_LOGIN_CONTROLS = (
+    ("#loginStay", "label[for='loginStay']"),
+    ("#keep", "label[for='keep']"),
+    ("input[name='nvlong']", None),
+)
+LOGIN_SUBMIT_SELECTORS = (
+    "#log\\.login",
+    "#loginBtn_row",
+    "#loginBtn_column",
+    "button[type='submit']",
+    "input[type='submit']",
+)
+
+
 async def set_keep_login(page, enabled: bool, emit: Callable[[str], None], user_id: str = ""):
-    selectors = [
-        "#keep",
-        "input[name='nvlong']",
-        "input[id*='keep' i]",
-        "label[for='keep']",
-    ]
-    for selector in selectors:
+    for input_selector, label_selector in KEEP_LOGIN_CONTROLS:
         try:
-            locator = page.locator(selector).first
-            if await locator.count() == 0:
+            checkbox = page.locator(input_selector).first
+            if await checkbox.count() == 0:
                 continue
-            tag = (await locator.evaluate("(el) => el.tagName.toLowerCase()")).lower()
-            if tag == "input":
-                checked = await locator.is_checked()
-                if bool(checked) != bool(enabled):
-                    await locator.click()
-            else:
-                input_checked = await page.locator("#keep").is_checked()
-                if bool(input_checked) != bool(enabled):
-                    await locator.click()
-            emit(f"{user_id}: login diagnostic - keep-login set to {enabled}")
-            return True
+            if bool(await checkbox.is_checked()) == bool(enabled):
+                emit(f"{user_id}: login diagnostic - keep-login already {enabled}")
+                return True
+            targets = [label_selector, input_selector] if label_selector else [input_selector]
+            for target in targets:
+                try:
+                    locator = page.locator(target).first
+                    if await locator.count() == 0:
+                        continue
+                    await locator.click(timeout=3000)
+                    if bool(await checkbox.is_checked()) == bool(enabled):
+                        emit(f"{user_id}: login diagnostic - keep-login set to {enabled}")
+                        return True
+                except Exception:
+                    continue
         except Exception:
             continue
     emit(f"{user_id}: login diagnostic - keep-login control not found")
     return False
+
+
+async def click_login_submit(page) -> Optional[str]:
+    """보이는 로그인 버튼을 눌러 그 선택자를 돌려준다. 못 누르면 None(호출부가 Enter로 폴백)."""
+    for selector in LOGIN_SUBMIT_SELECTORS:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() == 0 or not await locator.is_visible():
+                continue
+            await locator.click(timeout=5000)
+            return selector
+        except Exception:
+            continue
+    return None
 
 
 async def goto_naver_login(page, emit: Optional[Callable[[str], None]] = None, user_id: str = ""):
@@ -1117,13 +1216,11 @@ async def submit_login_captcha(user_id: str, captcha_text: str, cookie_dir: str,
                 return {"ret": "warning", "msg": "captcha input field not found", "screenshot": await _login_screenshot_payload(page)}
 
         await asyncio.sleep(0.5)
-        try:
-            submit = page.locator("#log\\.login").first
-            if await submit.count() == 0:
-                submit = page.locator("button[type='submit'], input[type='submit']").first
-            await submit.click(timeout=5000, force=True)
-        except Exception as e:
-            emit(f"{user_id}: manual login diagnostic - submit click failed: {e}; pressing Enter")
+        clicked = await click_login_submit(page)
+        if clicked:
+            emit(f"{user_id}: manual login diagnostic - submit clicked {clicked}")
+        else:
+            emit(f"{user_id}: manual login diagnostic - login button not found; pressing Enter")
             await page.keyboard.press("Enter")
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=3000)
@@ -1590,113 +1687,6 @@ async def handle_pincrux_short_live_cards(page, user_id: str, emit: Callable[[st
 async def expand_pincrux_live_more(page, max_clicks: int = 5):
     for _ in range(max_clicks):
         try:
-            button = page.locator("button, a, [role='button']").filter(has_text="라이브 더 보기").first
-            if await button.count() == 0:
-                break
-            await button.scroll_into_view_if_needed(timeout=2000)
-            await button.click(timeout=3000, force=True)
-            await asyncio.sleep(0.7)
-        except Exception:
-            break
-
-
-async def collect_pincrux_short_live_rows(page):
-    return await page.evaluate(
-        """() => {
-            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-            const toHref = el => {
-                const href = el.href || '';
-                if (href) return href;
-                const onclick = el.getAttribute('onclick') || '';
-                const match = onclick.match(/Go\\(['"]([^'"]+)['"]/);
-                if (!match) return '';
-                try {
-                    return new URL(match[1].replace(/&amp;/g, '&'), location.href).href;
-                } catch (e) {
-                    return match[1].replace(/&amp;/g, '&');
-                }
-            };
-            const candidates = [];
-            const seen = new Set();
-            const roots = Array.from(document.querySelectorAll('a[href], button, [role="button"], [onclick], .comming-list-item'));
-            for (const el of roots) {
-                const text = norm(el.innerText || el.textContent);
-                const onclick = el.getAttribute('onclick') || '';
-                const href = toHref(el);
-                const secondsMatch = text.match(/(\\d+)\\s*초\\s*보면/);
-                const pointMatch = text.match(/(\\d+)\\s*원/);
-                const isShortLive =
-                    secondsMatch ||
-                    ((href.includes('note.html') || onclick.includes('note.html')) && pointMatch) ||
-                    ((href.includes('live-view.html') || onclick.includes('live-view.html')) && pointMatch);
-                if (!isShortLive || /적립\\s*완료|적립완료/.test(text)) continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.width <= 0 || rect.height <= 0) continue;
-                if (!el.dataset.naverpaperShortLiveId) {
-                    el.dataset.naverpaperShortLiveId = String(candidates.length + 1);
-                }
-                let seconds = secondsMatch ? Number(secondsMatch[1] || 1) : 1;
-                if (!secondsMatch && (href.includes('live-view.html') || onclick.includes('live-view.html'))) {
-                    seconds = 5;
-                }
-                const key = href || el.dataset.naverpaperShortLiveId || text;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                candidates.push({
-                    id: el.dataset.naverpaperShortLiveId,
-                    href,
-                    text,
-                    seconds,
-                    point: pointMatch ? Number(pointMatch[1] || 0) : 0
-                });
-            }
-            return candidates;
-        }"""
-    )
-
-
-async def follow_pincrux_note_reward_button(page, seconds: int):
-    try:
-        body_text = await page.locator("body").inner_text(timeout=2000)
-    except Exception:
-        body_text = ""
-    if "초 보고" not in body_text or "적립" not in body_text:
-        return page
-    before_pages = list(page.context.pages)
-    clicked = await page.evaluate(
-        """(seconds) => {
-            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-            const exact = new RegExp(String(seconds) + '\\\\s*초\\\\s*보고\\\\s*\\\\d+\\\\s*원\\\\s*적립');
-            const loose = /\\d+\\s*초\\s*보고\\s*\\d+\\s*원\\s*적립/;
-            for (const el of Array.from(document.querySelectorAll('button, a, [role="button"], [onclick]'))) {
-                const text = norm(el.innerText || el.textContent);
-                if (!exact.test(text) && !loose.test(text)) continue;
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') continue;
-                el.click();
-                return true;
-            }
-            return false;
-        }""",
-        seconds,
-    )
-    if not clicked:
-        return page
-    await asyncio.sleep(1)
-    pages = list(page.context.pages)
-    new_pages = [candidate for candidate in pages if candidate not in before_pages]
-    active_page = new_pages[-1] if new_pages else page
-    try:
-        await active_page.wait_for_load_state("domcontentloaded", timeout=5000)
-    except Exception:
-        pass
-    return active_page
-
-
-async def expand_pincrux_live_more(page, max_clicks: int = 5):
-    for _ in range(max_clicks):
-        try:
             button = page.locator("button, a, [role='button']").filter(has_text=re.compile(r"\ub77c\uc774\ube0c\s*\ub354\s*\ubcf4\uae30")).first
             if await button.count() == 0:
                 break
@@ -2097,6 +2087,10 @@ async def process_campaign_links(page, campaign_links, session_db, user_id: str,
     excluded_reward_sources = excluded_reward_sources if excluded_reward_sources is not None else set()
     details = []
     for link in campaign_links:
+        reason = cancel_reason()
+        if reason:
+            emit(f"{user_id}: campaign visits interrupted ({reason}); remaining links left for next run")
+            break
         try:
             link_key = reward_source_key(link)
             if link_key in excluded_reward_sources:
@@ -2238,32 +2232,41 @@ async def process_account(
             has_touch=True,
             storage_state=storage_state,
         )
-        page = await context.new_page()
-        await Stealth().apply_stealth_async(page)
+        try:
+            page = await context.new_page()
+            await Stealth().apply_stealth_async(page)
 
-        login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
-        if login_ok:
-            before_points = await get_naverpay_point_balance(page)
-            details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
-            after_points = await get_naverpay_point_balance(page)
-            result.details.extend(details)
-            result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
-            result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url")])
-            if before_points is not None and after_points is not None:
-                result.estimated_points = max(0, after_points - before_points)
-                emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
+            login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
+            if login_ok:
+                before_points = await get_naverpay_point_balance(page)
+                details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
+                after_points = await get_naverpay_point_balance(page)
+                result.details.extend(details)
+                result.skipped_url_count += len([x for x in details if x.status in ("skipped", "unavailable", "no_url")])
+                result.visited_url_count = len([x for x in details if x.status not in ("error", "skipped", "unavailable", "no_url")])
+                if before_points is not None and after_points is not None:
+                    result.estimated_points = max(0, after_points - before_points)
+                    emit(f"{account.user_id}: point balance {before_points} -> {after_points} (+{result.estimated_points})")
+                else:
+                    result.estimated_points = 0
+                new_storage = await context.storage_state()
+                session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
+                with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
+                    json.dump(new_storage, f, ensure_ascii=False, indent=2)
             else:
-                result.estimated_points = 0
-            new_storage = await context.storage_state()
-            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
-            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
-                json.dump(new_storage, f, ensure_ascii=False, indent=2)
-        else:
-            result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
-        await context.close()
-        await browser.close()
+                result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
+        finally:
+            await _safe_close(context, browser)
 
     return result
+
+
+async def _safe_close(*closables):
+    for item in closables:
+        try:
+            await item.close()
+        except Exception:
+            pass
 
 
 async def get_naverpay_point_balance(page) -> Optional[int]:
@@ -2704,7 +2707,7 @@ async def process_naverpay_point_main(
     storage_state = await ensure_cookie_storage_state(account, session_db, cookie_dir, login_proxy_url, emit)
     if not storage_state:
         emit(f"naverpay point main skipped for {account.user_id}: cookie missing")
-        return
+        return False
 
     launch_kwargs = {"headless": True}
     proxy = playwright_proxy(reward_proxy_url)
@@ -2726,7 +2729,8 @@ async def process_naverpay_point_main(
             await page.wait_for_timeout(8000)
             body_text = await page.locator("body").inner_text(timeout=5000)
             if "로그인" in body_text[:500] and "포인트" not in body_text[:500]:
-                return
+                emit(f"naverpay point main not logged in for {account.user_id}")
+                return False
 
             point_rows = await _naverpay_text_hrefs(page, "클릭하고")
             live_rows = await _naverpay_text_hrefs(page, "쇼핑라이브 보고")
@@ -2746,9 +2750,9 @@ async def process_naverpay_point_main(
                 if is_reward_url(href):
                     add_reward_url(collected_urls, href)
                     emit(f"naverpay point main direct click link: {href}")
+            return True
         finally:
-            await context.close()
-            await browser.close()
+            await _safe_close(context, browser)
 
 
 async def process_naverpay_mission_detail_source(
@@ -2768,7 +2772,7 @@ async def process_naverpay_mission_detail_source(
     storage_state = await ensure_cookie_storage_state(account, session_db, cookie_dir, login_proxy_url, emit)
     if not storage_state:
         emit(f"naverpay mission detail skipped for {account.user_id}: cookie missing")
-        return
+        return False
 
     launch_kwargs = {"headless": True}
     proxy = playwright_proxy(reward_proxy_url)
@@ -2801,6 +2805,10 @@ async def process_naverpay_mission_detail_source(
             resolved_count = 0
             total = len(bridge_urls)
             for idx, bridge_url in enumerate(bridge_urls, 1):
+                reason = cancel_reason()
+                if reason:
+                    emit(f"naverpay mission detail resolving interrupted ({reason}) at {idx}/{total}")
+                    break
                 source_key = reward_source_key(bridge_url)
                 cached = source_resolutions.get(source_key)
                 if cached:
@@ -2849,9 +2857,9 @@ async def process_naverpay_mission_detail_source(
                 f"naverpay mission detail reward urls for {account.user_id}: "
                 f"campaign2={campaign_count} live-view={live_count} newly-resolved={resolved_count}"
             )
+            return True
         finally:
-            await context.close()
-            await browser.close()
+            await _safe_close(context, browser)
 
 
 async def collect_naverpay_mission_source_urls(page) -> list[str]:
@@ -3046,6 +3054,22 @@ async def _naverpay_text_hrefs(page, needle: str) -> list[tuple[str, str]]:
     return rows
 
 
+async def collect_with_account_fallback(accounts, collect, emit, label: str = "naverpay"):
+    """계정 순서대로 시도해 처음 성공한 계정을 돌려준다. 모두 실패하면 None."""
+    for account in accounts:
+        if cancel_reason():
+            return None
+        try:
+            if await collect(account):
+                return account
+            emit(f"{label}: collection with {account.user_id} failed; trying next account")
+        except Exception as e:
+            emit(f"{label}: collection error for {account.user_id} - {e}; trying next account")
+    if accounts:
+        emit(f"{label}: collection failed for all accounts")
+    return None
+
+
 async def save_naver_campaign_urls(
     session_db,
     emit: Callable[[str], None],
@@ -3072,25 +3096,40 @@ async def save_naver_campaign_urls(
         ("https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1", process_ppomppu_url),
         ("https://damoang.net/economy", process_damoang_url),
     ]
-    collector_account = (accounts or [None])[0]
-    if collector_account:
-        try:
-            account_urls = set()
-            emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}) started")
-            await process_naverpay_mission_detail_source(
-                collector_account,
-                session_db,
-                cookie_dir,
-                account_urls,
-                emit,
-                reward_proxy_url,
-                login_proxy_url,
-                source_resolutions,
-            )
-            add_collected_for_account(collector_account.user_id, account_urls)
-            emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({collector_account.user_id}): +{len(account_urls)}")
-        except Exception as e:
-            emit(f"{NAVERPAY_MISSION_DETAIL_URL}: collection error for {collector_account.user_id} - {e}")
+    async def collect_mission_detail(account):
+        account_urls = set()
+        emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({account.user_id}) started")
+        ok = await process_naverpay_mission_detail_source(
+            account,
+            session_db,
+            cookie_dir,
+            account_urls,
+            emit,
+            reward_proxy_url,
+            login_proxy_url,
+            source_resolutions,
+        )
+        add_collected_for_account(account.user_id, account_urls)
+        emit(f"collection source {NAVERPAY_MISSION_DETAIL_URL} ({account.user_id}): +{len(account_urls)}")
+        return ok
+
+    async def collect_point_main(account):
+        account_urls = set()
+        emit(f"collection source {NAVERPAY_MAIN_URL} ({account.user_id}) started")
+        ok = await process_naverpay_point_main(
+            account,
+            session_db,
+            cookie_dir,
+            account_urls,
+            emit,
+            reward_proxy_url,
+            login_proxy_url,
+        )
+        add_collected_for_account(account.user_id, account_urls)
+        emit(f"collection source {NAVERPAY_MAIN_URL} ({account.user_id}): +{len(account_urls)}")
+        return ok
+
+    await collect_with_account_fallback(accounts or [], collect_mission_detail, emit, label=NAVERPAY_MISSION_DETAIL_URL)
 
     timeout = ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
     async with ClientSession(timeout=timeout) as session:
@@ -3106,23 +3145,7 @@ async def save_naver_campaign_urls(
             except Exception as e:
                 emit(f"{url}: collection error - {e}")
 
-    if collector_account:
-        try:
-            account_urls = set()
-            emit(f"collection source {NAVERPAY_MAIN_URL} ({collector_account.user_id}) started")
-            await process_naverpay_point_main(
-                collector_account,
-                session_db,
-                cookie_dir,
-                account_urls,
-                emit,
-                reward_proxy_url,
-                login_proxy_url,
-            )
-            add_collected_for_account(collector_account.user_id, account_urls)
-            emit(f"collection source {NAVERPAY_MAIN_URL} ({collector_account.user_id}): +{len(account_urls)}")
-        except Exception as e:
-            emit(f"{NAVERPAY_MAIN_URL}: collection error for {collector_account.user_id} - {e}")
+    await collect_with_account_fallback(accounts or [], collect_point_main, emit, label=NAVERPAY_MAIN_URL)
 
     account_scoped_urls = set()
     for urls_for_account in account_collected_urls.values():

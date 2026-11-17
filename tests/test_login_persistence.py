@@ -277,3 +277,37 @@ def test_process_account_renews_before_visiting(fake_env, monkeypatch):
     asyncio.run(np.process_account(np.AccountConfig("u1", "pw"), session, str(tmp), "", lambda m: None, renew_days=5))
 
     assert seen == [("u1", 5)]
+
+
+# ---- 계정 화면 만료일 표시 ----------------------------------------------------------
+
+def test_expiry_info_for_keep_login_cookie():
+    now = time.mktime((2026, 11, 17, 12, 0, 0, 0, 0, -1))
+    exp = time.mktime((2027, 11, 17, 12, 0, 0, 0, 0, -1))
+    info = np.cookie_expiry_info(_storage(NID_AUT=exp, NID_SES=-1), 7, now)
+
+    assert info["expires"] == "2027-11-17"
+    assert info["days_left"] == 365
+    assert info["renew_from"] == "2027-11-10"
+    assert info["session"] is False and info["renew_due"] is False
+
+
+def test_expiry_info_for_session_and_due_cookies():
+    now = time.time()
+    session = np.cookie_expiry_info(_storage(NID_AUT=-1, NID_SES=-1), 7, now)
+    assert session["session"] is True and session["renew_due"] is True and session["expires"] == ""
+
+    due = np.cookie_expiry_info(_storage(NID_AUT=now + 3 * DAY, NID_SES=-1), 7, now)
+    assert due["renew_due"] is True and due["days_left"] == 3
+
+    assert np.cookie_expiry_info({"cookies": []}, 7, now) is None
+
+
+def test_cookie_statuses_include_expiry(tmp_path):
+    cookie_dir = str(tmp_path / "cookies")
+    _write_cookie(cookie_dir, "u1", _storage(NID_AUT=time.time() + 100 * DAY, NID_SES=-1))
+
+    rows = np.cookie_statuses(str(tmp_path / "db.sqlite"), cookie_dir, [np.AccountConfig("u1", "pw"), np.AccountConfig("u2", "pw")], 7)
+
+    assert rows[0]["expiry"]["days_left"] in (99, 100)
+    assert rows[1]["expiry"] is None

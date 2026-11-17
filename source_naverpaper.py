@@ -645,6 +645,26 @@ def needs_cookie_renewal(storage, days: int, now: Optional[float] = None):
     return False, f"NID_AUT expires in {days_left:.0f} days"
 
 
+def cookie_expiry_info(storage, renew_days: int = 7, now: Optional[float] = None):
+    """계정 화면 표시용 로그인 유지(NID_AUT) 만료 정보. 로그인 쿠키가 없으면 None."""
+    if not check_storage_data_status(storage)[0]:
+        return None
+    now = time.time() if now is None else now
+    aut = next((c for c in (storage or {}).get("cookies", []) if c.get("name") == "NID_AUT"), {})
+    exp = aut.get("expires", -1)
+    due = needs_cookie_renewal(storage, renew_days, now)[0]
+    if exp is None or exp == -1:
+        return {"session": True, "expires": "", "days_left": None, "renew_from": "", "renew_due": due}
+    fmt = lambda ts: time.strftime("%Y-%m-%d", time.localtime(ts))  # noqa: E731
+    return {
+        "session": False,
+        "expires": fmt(exp),
+        "days_left": int((exp - now) // 86400),
+        "renew_from": fmt(exp - renew_days * 86400) if renew_days and renew_days > 0 else "",
+        "renew_due": due,
+    }
+
+
 def load_cookie_file(nid: str, cookie_dir: str):
     try:
         with open(cookie_path(cookie_dir, nid), "r", encoding="utf-8") as f:
@@ -3481,7 +3501,7 @@ def run_account_summaries(db_path: str, run_id: int):
         return [grouped[user_id] for user_id in order]
 
 
-def cookie_statuses(db_path: str, cookie_dir: str, accounts: list[AccountConfig]):
+def cookie_statuses(db_path: str, cookie_dir: str, accounts: list[AccountConfig], renew_days: int = 7):
     db = Database(db_path)
     db.create_all()
     rows = []
@@ -3496,6 +3516,7 @@ def cookie_statuses(db_path: str, cookie_dir: str, accounts: list[AccountConfig]
                     "message": message,
                     "db_storage": bool(user and user.storage_state),
                     "updated_at": user.updated_at.strftime("%Y-%m-%d %H:%M:%S") if user and user.updated_at else "",
+                    "expiry": cookie_expiry_info(load_cookie_file(account.user_id, cookie_dir) or {}, renew_days),
                 }
             )
     return rows

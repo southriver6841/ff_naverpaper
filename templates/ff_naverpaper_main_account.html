@@ -477,10 +477,28 @@ function formatCookieStatus(status) {
     label = '쿠키 없음';
   }
 
+  var expiry = status ? formatCookieExpiry(status.expiry) : '';
+  if (status && status.valid && expiry) {
+    return {text: label + ' · ' + expiry, className: className, title: message};
+  }
   if (!message) {
     return {text: label, className: className};
   }
-  return {text: label + ' - ' + message, className: className};
+  return {text: label + ' - ' + message, className: className, title: message};
+}
+
+function formatCookieExpiry(expiry) {
+  if (!expiry) return '';
+  if (expiry.session) {
+    return '로그인 유지 안 됨(세션 쿠키) - 다음 실행 때 자동 재로그인';
+  }
+  var text = '로그인 유지 만료 ' + expiry.expires + ' (' + expiry.days_left + '일 남음)';
+  if (expiry.renew_due) {
+    text += ' - 다음 실행 때 자동 연장';
+  } else if (expiry.renew_from) {
+    text += ' · 자동 연장 ' + expiry.renew_from + '부터';
+  }
+  return text;
 }
 
 function setCookieStatusField(id, result) {
@@ -489,6 +507,7 @@ function setCookieStatusField(id, result) {
   $target
     .removeClass('ok warn')
     .addClass(result.className || '')
+    .attr('title', result.title || '')
     .text(result.text || '');
 }
 

@@ -133,7 +133,7 @@ class ModuleMain(PluginModuleBase):
         arg["accounts"] = accounts
         arg["profiles"] = self._profiles(np_module)
         arg["profiles_json"] = json.dumps(arg["profiles"], ensure_ascii=False)
-        arg["cookie_statuses"] = np_module.cookie_statuses(self._db_path(), self._cookie_dir(), accounts) if np_module else []
+        arg["cookie_statuses"] = np_module.cookie_statuses(self._db_path(), self._cookie_dir(), accounts, self._renew_days()) if np_module else []
         if sub == "result":
             arg["runs"] = np_module.recent_runs(self._db_path(), 50) if np_module else []
             profile_order = [item.get("user_id") for item in arg["profiles"] if item.get("user_id")]
@@ -160,7 +160,7 @@ class ModuleMain(PluginModuleBase):
                 warning = self._source_dependency_warning()
                 if warning:
                     return jsonify(warning)
-                return jsonify({"ret": "success", "data": self._np().cookie_statuses(self._db_path(), self._cookie_dir(), self._accounts())})
+                return jsonify({"ret": "success", "data": self._np().cookie_statuses(self._db_path(), self._cookie_dir(), self._accounts(), self._renew_days())})
             if command == "profile_save":
                 return jsonify(self._profile_save(arg1))
             if command == "profile_save_all":
@@ -334,7 +334,7 @@ class ModuleMain(PluginModuleBase):
             keep_campaign_days=self._int_setting("keep_campaign_days", 60),
             keep_user_days=self._int_setting("keep_user_days", 7),
             max_run_seconds=max(0, self._int_setting("max_run_minutes", 60)) * 60,
-            cookie_renew_days=max(0, self._int_setting("cookie_renew_days", 7)),
+            cookie_renew_days=self._renew_days(),
         )
         return np_module.run_sync(config, log=lambda msg: P.logger.info(f"[NaverPaper] {msg}"))
 
@@ -430,7 +430,7 @@ class ModuleMain(PluginModuleBase):
         np_module = self._try_np()
         return {
             "profiles": self._profiles(np_module),
-            "cookie_statuses": np_module.cookie_statuses(self._db_path(), self._cookie_dir(), self._accounts(np_module)) if np_module else [],
+            "cookie_statuses": np_module.cookie_statuses(self._db_path(), self._cookie_dir(), self._accounts(np_module), self._renew_days()) if np_module else [],
         }
 
     def _profile_save(self, payload):
@@ -743,6 +743,9 @@ class ModuleMain(PluginModuleBase):
         if value is None or value == "":
             return default
         return str(value).strip().lower() in ("true", "1", "on", "yes")
+
+    def _renew_days(self):
+        return max(0, self._int_setting("cookie_renew_days", 7))
 
     def _int_setting(self, key, default):
         try:

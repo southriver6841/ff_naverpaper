@@ -584,33 +584,42 @@ def get_storage_state(nid: str, session_db, cookie_dir: str):
     return None
 
 
-def check_storage_data_status(data):
-    import time
+REQUIRED_LOGIN_COOKIES = ("NID_AUT", "NID_SES")
 
+
+def check_storage_data_status(data):
+    """저장된 쿠키로 로그인 상태를 쓸 수 있는지 (로컬 판정).
+
+    - NID_AUT, NID_SES 가 있고 만료일이 지나지 않았으면 사용한다.
+    - 만료일 없는 세션 쿠키(expires=-1)도 저장해 두면 계속 쓸 수 있으므로 허용한다.
+      (예전에는 세션 쿠키인 NID_JST 하나 때문에 매 실행 재로그인했다)
+    - 실제로 네이버가 받아 주는지는 process_account 에서 접속해 보고 판단한다.
+    """
     now = time.time()
-    key_cookies = ("NID_AUT", "NID_SES", "NID_JST")
-    required_cookies = ("NID_AUT", "NID_SES")
-    expired = []
-    session_only = []
-    valid = []
+    state = {}
     for cookie in (data or {}).get("cookies", []):
-        if cookie.get("name") not in key_cookies:
+        name = cookie.get("name")
+        if name not in REQUIRED_LOGIN_COOKIES or not cookie.get("value", "x"):
             continue
         exp = cookie.get("expires", -1)
-        if exp == -1:
-            session_only.append(cookie.get("name"))
+        if exp is None or exp == -1:
+            state.setdefault(name, "session")
         elif exp < now:
-            expired.append(cookie.get("name"))
+            state[name] = state.get(name) if state.get(name) in ("valid", "session") else "expired"
         else:
-            valid.append(cookie.get("name"))
+            state[name] = "valid"
+    expired = [n for n in REQUIRED_LOGIN_COOKIES if state.get(n) == "expired"]
     if expired:
         return False, f"expired cookies: {', '.join(expired)}"
-    if session_only:
-        return False, f"session-only cookies: {', '.join(session_only)}"
-    missing = [name for name in required_cookies if not any(item.startswith(name) or item == name for item in valid)]
+    missing = [n for n in REQUIRED_LOGIN_COOKIES if n not in state]
     if missing:
         return False, f"required cookies missing: {', '.join(missing)}"
-    return True, f"valid cookies: {', '.join(valid)}"
+    return True, "usable cookies: " + ", ".join(f"{n}({state[n]})" for n in REQUIRED_LOGIN_COOKIES)
+
+
+def is_naver_login_page(url: str) -> bool:
+    """로그인이 필요한 페이지를 열었는데 여기로 오면 저장 쿠키가 거부된 것."""
+    return "nid.naver.com" in str(url or "")
 
 
 def check_cookie_status(nid: str, cookie_dir: str):
@@ -853,13 +862,25 @@ async def refresh_cookie_from_profile(
     proxy_url: str = "",
     emit: Optional[Callable[[str], None]] = None,
     allow_password_login: bool = True,
+    verify_online: bool = False,
 ):
+    """브라우저 프로필 쿠키 → (필요하면) 아이디/비밀번호 로그인으로 쿠키를 갱신한다.
+
+    verify_online=True 면 로컬 쿠키 판정을 믿지 않고, 네이버페이 페이지를 열어
+    로그인 페이지로 튕기지 않는지 확인한다(저장 쿠키가 네이버에서 거부됐을 때 사용).
+    """
     from playwright.async_api import async_playwright
     from playwright_stealth import Stealth
 
     def log(message: str):
         if emit:
             emit(message)
+
+    def usable(storage, page_url):
+        ok, message = check_storage_data_status(storage)
+        if ok and verify_online and is_naver_login_page(page_url):
+            return False, "naver redirected to login page"
+        return ok, message
 
     if not account.user_id:
         return False, "account id required"
@@ -887,12 +908,13 @@ async def refresh_cookie_from_profile(
             page = context.pages[0] if context.pages else await context.new_page()
             await Stealth().apply_stealth_async(page)
 
-            storage = await context.storage_state()
-            ok, message = check_storage_data_status(storage)
-            if ok:
-                save_storage_state(cookie_dir, account.user_id, storage)
-                log(f"{account.user_id}: cookie auto refresh from browser profile ({message})")
-                return True, message
+            if not verify_online:
+                storage = await context.storage_state()
+                ok, message = check_storage_data_status(storage)
+                if ok:
+                    save_storage_state(cookie_dir, account.user_id, storage)
+                    log(f"{account.user_id}: cookie auto refresh from browser profile ({message})")
+                    return True, message
 
             try:
                 log(f"{account.user_id}: cookie auto refresh checking pay login page")
@@ -902,7 +924,7 @@ async def refresh_cookie_from_profile(
                 log(f"{account.user_id}: browser profile login check failed - {e}")
 
             storage = await context.storage_state()
-            ok, message = check_storage_data_status(storage)
+            ok, message = usable(storage, page.url)
             if ok:
                 save_storage_state(cookie_dir, account.user_id, storage)
                 log(f"{account.user_id}: cookie auto refresh after login check ({message})")
@@ -2224,21 +2246,39 @@ async def process_account(
         if proxy:
             launch_kwargs["proxy"] = proxy
         browser = await playwright.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            user_agent=IPHONE13_UA,
-            viewport={"width": 390, "height": 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
-            storage_state=storage_state,
-        )
+
+        async def open_context(state):
+            ctx = await browser.new_context(
+                user_agent=IPHONE13_UA,
+                viewport={"width": 390, "height": 844},
+                device_scale_factor=3,
+                is_mobile=True,
+                has_touch=True,
+                storage_state=state,
+            )
+            pg = await ctx.new_page()
+            await Stealth().apply_stealth_async(pg)
+            return ctx, pg
+
+        context, page = None, None
         try:
-            page = await context.new_page()
-            await Stealth().apply_stealth_async(page)
+            context, page = await open_context(storage_state)
 
             login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
+            before_points = await get_naverpay_point_balance(page) if login_ok else None
+            if login_ok and before_points is None and is_naver_login_page(page.url):
+                # 저장 쿠키를 네이버가 거부한 경우에만 다시 로그인한다
+                emit(f"{account.user_id}: saved cookie rejected by naver; re-login")
+                relogin_ok, relogin_message = await refresh_cookie_from_profile(
+                    account, cookie_dir, login_proxy_url, emit, allow_password_login=True, verify_online=True
+                )
+                if relogin_ok:
+                    await _safe_close(context)
+                    context, page = await open_context(get_storage_state(account.user_id, session_db, cookie_dir))
+                    before_points = await get_naverpay_point_balance(page)
+                if not relogin_ok or (before_points is None and is_naver_login_page(page.url)):
+                    login_ok, login_message = False, f"re-login failed: {relogin_message}"
             if login_ok:
-                before_points = await get_naverpay_point_balance(page)
                 details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
                 after_points = await get_naverpay_point_balance(page)
                 result.details.extend(details)
